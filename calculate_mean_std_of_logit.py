@@ -130,6 +130,14 @@ if __name__ == '__main__':
             model
         )
         model.to(device)
+    elif args.model_type == 'mobilenetv2':
+        model = models.mobilenet_v2()
+        model.load_state_dict(torch.load(os.path.join(args.model_dir, 'mobilenetv2_checkpoint.pth')))
+        model = nn.Sequential(
+            Normalize(),
+            model
+        )
+        model.to(device)
     model.eval()
 
     transform = transforms.Compose([transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor()])
