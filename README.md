@@ -41,7 +41,7 @@ This repository is the official Pytorch code implementation for our paper "Rethi
     python evaluate_comparison_with_baselines_ens.py --model-type Ens
     ```
 
-  - If you want to choose other surrogate models such as MobileNetv2, you need to run the following code to achieve the distribution of manifold feature.
+  - If you want to choose other surrogate models such as MobileNetv2, you need to firstly run the following code to achieve the distribution of manifold feature.
  
     ```python
     python calculate_mean_std_of_logit.py --model-type mobilenetv2
