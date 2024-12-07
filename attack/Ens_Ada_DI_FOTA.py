@@ -1,0 +1,196 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import torch.nn.functional as F
+from torch.distributions.normal import Normal
+
+from attack.attack import Attack
+from attack.utils import temperature_scaling, fuzziness_tuned
+
+class Ens_Ada_DI_FOTA(Attack):
+    r"""
+
+    Distance Measure : Linf
+
+    Arguments:
+        model (nn.Module): model to attack.
+        eps (float): maximum perturbation. (Default: 8/255)
+        alpha (float): step size. (Default: 2/255)
+        decay (float): momentum factor. (Default: 1.0)
+        steps (int): number of iterations. (Default: 5)
+
+    Shape:
+        - images: :math:`(N, C, H, W)` where `N = number of batches`, `C = number of channels`,        `H = height` and `W = width`. It must have a range [0, 1].
+        - labels: :math:`(N)` where each value :math:`y_i` is :math:`0 \leq y_i \leq` `number of labels`.
+        - output: :math:`(N, C, H, W)`.
+
+    """
+
+    def __init__(self, model_set, eps=8/255, alpha=2/255, max_steps=5, membership_degree_threshold=0.8, decay=1.0,
+                 tau=1.0, kappa1=1.0, kappa2=1.0, num_classes=100,
+                 correct_logit_mean_std_set=None, wrong_logit_mean_std_set=None):
+        super().__init__("Ens_Ada_DI_FOTA", model_set[0])
+        self.model_set = model_set
+        self.eps = eps
+        self.max_steps = max_steps
+        self.membership_degree_threshold = membership_degree_threshold
+        self.decay = decay
+        self.alpha = alpha
+        self._supported_mode = ['default', 'targeted']
+        self.num_classes = num_classes
+        self.correct_logit_mean_std_set = correct_logit_mean_std_set
+        self.wrong_logit_mean_std_set = wrong_logit_mean_std_set
+        self.tau = tau
+        self.kappa1 = kappa1
+        self.kappa2 = kappa2
+
+        self.resize_rate = 0.9
+        self.diversity_prob = 0.5
+
+    def input_diversity(self, x):
+        img_size = x.shape[-1]
+        img_resize = int(img_size * self.resize_rate)
+
+        if self.resize_rate < 1:
+            img_size = img_resize
+            img_resize = x.shape[-1]
+
+        rnd = torch.randint(low=img_size, high=img_resize, size=(1,), dtype=torch.int32)
+        rescaled = F.interpolate(x, size=[rnd, rnd], mode='bilinear', align_corners=False)
+        h_rem = img_resize - rnd
+        w_rem = img_resize - rnd
+        pad_top = torch.randint(low=0, high=h_rem.item(), size=(1,), dtype=torch.int32)
+        pad_bottom = h_rem - pad_top
+        pad_left = torch.randint(low=0, high=w_rem.item(), size=(1,), dtype=torch.int32)
+        pad_right = w_rem - pad_left
+
+        padded = F.pad(rescaled, [pad_left.item(), pad_right.item(), pad_top.item(), pad_bottom.item()], value=0)
+
+        return padded if torch.rand(1) < self.diversity_prob else x
+
+    def forward(self, images, labels, lambda1=0.5, lambda2=1.0):
+        r"""
+        Overridden.
+        """
+        images = images.clone().detach().to(self.device)
+        labels = labels.clone().detach().to(self.device)
+        lambda1 = torch.tensor(1-lambda1).to(self.device)
+        lambda2 = torch.tensor(lambda2).to(self.device)
+
+        if self._targeted:
+            target_labels = self._get_target_label(images, labels)
+
+
+        momentum = torch.zeros_like(images).detach().to(self.device)
+
+        loss = nn.CrossEntropyLoss()
+
+        adv_images = images.clone().detach()
+
+        wrong_logit_mean_set = []
+        wrong_logit_std_set = []
+        correct_logit_mean_set = []
+        correct_logit_std_set = []
+        # 加载images的outputs中有关的隶属度函数
+        for i in range(len(self.wrong_logit_mean_std_set)):
+            wrong_logit_mean_set.append(torch.zeros(len(images), self.num_classes).to(self.device) + self.wrong_logit_mean_std_set[i][:, 0])
+            wrong_logit_std_set.append(torch.zeros(len(images), self.num_classes).to(self.device) + self.wrong_logit_mean_std_set[i][:, 1])
+            correct_logit_mean_set.append(torch.zeros(len(images), self.num_classes).to(self.device) + self.correct_logit_mean_std_set[i][:, 0])
+            correct_logit_std_set.append(torch.zeros(len(images), self.num_classes).to(self.device) + self.correct_logit_mean_std_set[i][:, 1])
+
+        # All examples are initialized as True to indicate the attacking is not finished.
+        finished_signs = torch.ones(len(images)).to(self.device)
+        step_count = 0
+        iteration_statistic = torch.zeros_like(finished_signs)
+
+        while finished_signs.sum() != 0 and step_count < self.max_steps:
+            membership_degrees = torch.zeros(len(images)).to(self.device)
+            adv_images.requires_grad = True
+
+            outputs_sum = torch.zeros(len(adv_images), self.num_classes).to(self.device)
+            for i in range(len(self.model_set)):
+                model = self.model_set[i]
+                outputs = model(self.input_diversity(adv_images))
+                wrong_logit_mean = wrong_logit_mean_set[i]
+                wrong_logit_std = wrong_logit_std_set[i]
+                correct_logit_mean = correct_logit_mean_set[i]
+                correct_logit_std = correct_logit_std_set[i]
+
+                # 确定成功攻击的对抗样本以及目标错误类别
+                success_index = (outputs.argmax(dim=1) != labels)
+                success_labels = outputs.argmax(dim=1)[success_index]
+                # 确定outputs相同shape的bool矩阵
+                truncate_index = torch.zeros_like(outputs)
+                success_labels_onehot = F.one_hot(success_labels, self.num_classes)
+                truncate_index[success_index] = success_labels_onehot.float()
+                truncate_index_copied = truncate_index.clone()
+                # 确定截断阈值
+                membership_function_mean = wrong_logit_mean
+                membership_function_std = wrong_logit_std
+                membership_function_mean[truncate_index.bool()] = correct_logit_mean[truncate_index.bool()]
+                membership_function_std[truncate_index.bool()] = correct_logit_std[truncate_index.bool()]
+                GaussDistrib = Normal(membership_function_mean, membership_function_std)
+                Thresholds2 = GaussDistrib.icdf(lambda2)
+
+                truncate_index = (truncate_index.bool() & (outputs >= Thresholds2)).float()
+
+                # 对outputs进行截断操作
+                outputs[truncate_index.bool()] = Thresholds2[truncate_index.bool()]
+                # calculate the membership degree of the true category
+                membership_degree_matrix2 = GaussDistrib.cdf(outputs)
+                membership_degrees[success_index] += (membership_degree_matrix2[truncate_index_copied.bool()]) / lambda2
+
+                # 对原正确类别的outputs进行截断
+                correct_labels_onehot = F.one_hot(labels, self.num_classes)
+                Thresholds1 = GaussDistrib.icdf(lambda1)
+                correct_truncate_index = (correct_labels_onehot.bool() & (outputs <= Thresholds1))
+                outputs[correct_truncate_index] = Thresholds1[correct_truncate_index]
+                # calculate the membership degree of the misclassified category
+                membership_degree_matrix1 = GaussDistrib.cdf(outputs)
+                membership_degrees += (1-membership_degree_matrix1[correct_labels_onehot.bool()]) / (1-lambda1)
+                # achieve the final degree
+                membership_degrees = membership_degrees / 2
+
+                # fuzziness tuned methods and temperature scaling
+                outputs = fuzziness_tuned(outputs, labels, fuzzy_scale_true=self.kappa1, fuzzy_scale_wrong_pred=self.kappa2)
+                outputs = temperature_scaling(outputs, temperature_scale=self.tau)
+
+                outputs_sum += outputs
+
+            outputs_avg = outputs_sum / len(self.model_set)
+            membership_degrees = membership_degrees / len(self.model_set)
+            # update the finished sign, 0 indicates finished, 1 indicates un-finished
+            finished_signs = ((finished_signs.bool()) & (
+                        membership_degrees < self.membership_degree_threshold)).detach().float()
+            # update the iteration steps of new finished images
+            iteration_statistic[(~finished_signs.bool()) & (iteration_statistic == 0)] = step_count
+            step_count += 1
+
+            # Calculate loss
+            if self._targeted:
+                cost = -loss(outputs_avg, target_labels)
+            else:
+                cost = loss(outputs_avg, labels)
+
+            # Update adversarial images
+            grad = torch.autograd.grad(cost, adv_images,
+                                       retain_graph=False, create_graph=False)[0]
+
+            grad = grad / torch.mean(torch.abs(grad), dim=(1,2,3), keepdim=True)
+            grad = grad + momentum*self.decay
+            momentum = grad
+
+            # update the unfinished images
+            adv_images = adv_images.detach()
+            adv_images_temp = adv_images + self.alpha*grad.sign()
+            adv_images[finished_signs.bool()] = (adv_images_temp.detach())[finished_signs.bool()]
+            delta = torch.clamp(adv_images - images, min=-self.eps, max=self.eps)
+            adv_images = torch.clamp(images + delta, min=0, max=1).detach()
+
+        iteration_statistic[iteration_statistic==0] = self.max_steps
+
+        if self._targeted:
+            return adv_images, target_labels
+        else:
+            return adv_images, iteration_statistic.detach().cpu().tolist(), membership_degrees.detach().cpu().tolist()
+
