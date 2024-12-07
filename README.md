@@ -14,9 +14,47 @@ This repository is the official Pytorch code implementation for our paper "Rethi
 </ul>
 
 ## Implementation
-<ul>
-<li>Download the models (Place the pretrained weights in the "saved_models" folder)</li>
-<ul>
-<li>[Naturally trained models](https://pytorch.org/vision/stable/models.html)</li>
-</ul>
-</ul>
+
+- Download the models (Place the pretrained weights in the "saved_models" folder)
+
+  - [Naturally trained models](https://pytorch.org/vision/stable/models.html)
+
+  - [Adversarially trained models](https://huggingface.co/models)
+
+- Place these pretrained weights in the "saved_models" folder
+
+- Run the code
+
+  - Single surrogate model: choose one of surrogate model from the set \{VGG16, ResNet50, ResNet152\}
+
+    ```python
+    python evaluate_comparison_with_baselines.py --model-type vgg16
+
+    python evaluate_comparison_with_baselines.py --model-type resnet50
+
+    python evaluate_comparison_with_baselines.py --model-type resnet152
+    ```
+
+  - Ensemble surrogate model: is consisted by \{VGG16, ResNet50, ResNet152\}
+   
+    ```python
+    python evaluate_comparison_with_baselines_ens.py --model-type Ens
+    ```
+
+  - If you want to choose other surrogate models such as MobileNetv2, you need to run the following code to achieve the distribution of manifold feature.
+ 
+    ```python
+    python calculate_mean_std_of_logit.py --model-type mobilenetv2
+    ```
+
+## Acknowledgments
+
+Code refers to [adversarial-attacks-pytorch](https://github.com/Harry24k/adversarial-attacks-pytorch) and [VT](https://github.com/JHL-HUST/VT)
+
+## Citing this work
+
+If you find this work is useful in your research, please consider citing:
+
+```
+xxx
+```
